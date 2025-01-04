@@ -2,6 +2,8 @@
 
 This custom integration allows you to monitor your vehicle statistics from OCTO Telematics in Home Assistant.
 
+![OCTO Telematics Screenshot](/docs/screenshot.png)
+
 ## Features
 
 - Displays total kilometers driven
