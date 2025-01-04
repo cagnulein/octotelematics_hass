@@ -1,5 +1,7 @@
 """Data update coordinator for OCTO Telematics."""
 import logging
+import asyncio
+import re
 from datetime import timedelta
 import async_timeout
 import aiohttp
@@ -8,6 +10,8 @@ from bs4 import BeautifulSoup
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.exceptions import ConfigEntryAuthFailed
+
+from .const import URLS
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -102,7 +106,7 @@ class OctoDataUpdateCoordinator(DataUpdateCoordinator):
         """Login to OCTO Telematics."""
         try:
             # Get initial cookies
-            async with self._session.get("https://www.octotelematics.it/octo/login.jsp") as response:
+            async with self._session.get(URLS["login"]) as response:
                 if response.status != 200:
                     raise ConfigEntryAuthFailed("Failed to access login page")
                 
@@ -113,7 +117,7 @@ class OctoDataUpdateCoordinator(DataUpdateCoordinator):
             }
             
             async with self._session.post(
-                "https://www.octotelematics.it/octo/login",
+                URLS["login_post"],
                 data=login_data,
                 allow_redirects=True
             ) as response:
@@ -124,32 +128,3 @@ class OctoDataUpdateCoordinator(DataUpdateCoordinator):
 
         except aiohttp.ClientError as err:
             raise ConfigEntryAuthFailed(f"Failed to login: {err}")
-
-    async def _get_stats(self):
-        """Get vehicle statistics."""
-        try:
-            async with self._session.get(
-                "https://www.octotelematics.it/octo/assicurazioni/statistics.jsp",
-                cookies=self._cookies
-            ) as response:
-                if response.status != 200:
-                    raise UpdateFailed("Failed to get statistics")
-                
-                html = await response.text()
-                soup = BeautifulSoup(html, 'html.parser')
-                
-                # Find the total kilometers element
-                km_element = soup.find(text="KM TOTALI PERCORSI:")
-                if km_element:
-                    km_value = km_element.find_next(text=True).strip()
-                    try:
-                        total_km = float(km_value.replace(',', ''))
-                        return {"total_km": total_km}
-                    except ValueError:
-                        raise UpdateFailed(f"Failed to parse kilometers value: {km_value}")
-                
-                raise UpdateFailed("Could not find kilometers data")
-
-        except aiohttp.ClientError as err:
-            raise UpdateFailed(f"Error fetching statistics: {err}")
-
