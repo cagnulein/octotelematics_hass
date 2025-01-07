@@ -30,77 +30,126 @@ class OctoDataUpdateCoordinator(DataUpdateCoordinator):
         self._password = password
         self._session = session
         self._cookies = {}
+        self._last_known_values = {
+            "total_km": None,
+            "updated_at": "Unknown"
+        }
+        self._consecutive_failures = 0
+        self._max_retries = 3
+
+    async def _extract_km_value(self, stats_div) -> tuple[int, bool]:
+        """Extract kilometer value from stats div."""
+        try:
+            km_rows = stats_div.find_all('tr', attrs={'align': 'center'})
+            for row in km_rows:
+                text = row.get_text(strip=True)
+                if 'KM TOTALI PERCORSI' in text:
+                    numbers = re.findall(r'\d+', text)
+                    if numbers:
+                        return int(numbers[-1]), True
+            return self._last_known_values["total_km"] or 0, False
+        except Exception as err:
+            _LOGGER.warning("Error extracting KM value: %s", err)
+            return self._last_known_values["total_km"] or 0, False
+
+    async def _extract_update_date(self, stats_div) -> tuple[str, bool]:
+        """Extract update date from stats div."""
+        try:
+            all_tables = stats_div.find_all('table')
+            for table in all_tables:
+                cells = table.find_all('td', {'class': 'inputMask'})
+                for i, cell in enumerate(cells):
+                    if cell.get_text(strip=True) == 'AL:':
+                        if i + 1 < len(cells):
+                            date_text = cells[i + 1].get_text(strip=True)
+                            if date_text:
+                                try:
+                                    day, month, year = date_text.split('/')
+                                    return f"{year}-{month.zfill(2)}-{day.zfill(2)}", True
+                                except Exception as err:
+                                    _LOGGER.warning("Error parsing date: %s", err)
+            return self._last_known_values["updated_at"], False
+        except Exception as err:
+            _LOGGER.warning("Error extracting update date: %s", err)
+            return self._last_known_values["updated_at"], False
 
     async def _async_update_data(self):
         """Fetch data from OCTO Telematics."""
-        try:
-            async with async_timeout.timeout(30):
-                if not self._cookies:
-                    await self._login()
+        for attempt in range(self._max_retries):
+            try:
+                async with async_timeout.timeout(30):
+                    if not self._cookies:
+                        await self._login()
 
-                # Get statistics page
-                async with self._session.get(
-                    f"{URLS['base']}/clienti/consumiCustomer.jsp",
-                    cookies=self._cookies
-                ) as response:
-                    if response.status != 200:
-                        raise UpdateFailed("Failed to get statistics")
-                    
-                    html = await response.text()
-                    soup = BeautifulSoup(html, 'html.parser')
+                    # Get statistics page
+                    async with self._session.get(
+                        f"{URLS['base']}/clienti/consumiCustomer.jsp",
+                        cookies=self._cookies
+                    ) as response:
+                        if response.status == 401:
+                            self._cookies = {}  # Clear cookies to force re-login
+                            if attempt < self._max_retries - 1:
+                                continue
+                            raise ConfigEntryAuthFailed("Session expired")
+                        
+                        if response.status != 200:
+                            _LOGGER.warning("Failed to get statistics, status: %s", response.status)
+                            if attempt < self._max_retries - 1:
+                                continue
+                            return self._last_known_values
 
-                    # Find kilometers section
-                    stats_div = soup.find('div', {'id': 'statPage2'})
-                    if not stats_div:
-                        raise UpdateFailed("Could not find statistics div")
+                        html = await response.text()
+                        soup = BeautifulSoup(html, 'html.parser')
 
-                    # Find KM
-                    total_km = None
-                    km_rows = stats_div.find_all('tr', attrs={'align': 'center'})
-                    for row in km_rows:
-                        text = row.get_text(strip=True)
-                        if 'KM TOTALI PERCORSI' in text:
-                            numbers = re.findall(r'\d+', text)
-                            if numbers:
-                                total_km = int(numbers[-1])
-                                break
+                        # Find statistics section
+                        stats_div = soup.find('div', {'id': 'statPage2'})
+                        if not stats_div:
+                            _LOGGER.warning("Statistics div not found in HTML response")
+                            if attempt < self._max_retries - 1:
+                                continue
+                            return self._last_known_values
 
-                    if not total_km:
-                        raise UpdateFailed("Could not find KM value")
+                        # Extract KM value and update date
+                        total_km, km_success = await self._extract_km_value(stats_div)
+                        update_date, date_success = await self._extract_update_date(stats_div)
 
-                    # Find end date
-                    update_date = None
-                    all_tables = stats_div.find_all('table')
-                    for table in all_tables:
-                        cells = table.find_all('td', {'class': 'inputMask'})
-                        for i, cell in enumerate(cells):
-                            if cell.get_text(strip=True) == 'AL:':
-                                if i + 1 < len(cells):
-                                    date_text = cells[i + 1].get_text(strip=True)
-                                    if date_text:
-                                        try:
-                                            day, month, year = date_text.split('/')
-                                            update_date = f"{year}-{month.zfill(2)}-{day.zfill(2)}"
-                                            break
-                                        except Exception as err:
-                                            _LOGGER.error("Error parsing date: %s", err)
-                        if update_date:
-                            break
+                        # Update last known values if extraction was successful
+                        if km_success:
+                            self._last_known_values["total_km"] = total_km
+                        if date_success:
+                            self._last_known_values["updated_at"] = update_date
 
-                    if not update_date:
-                        update_date = "Unknown"
+                        self._consecutive_failures = 0
+                        return {
+                            "total_km": total_km,
+                            "updated_at": update_date
+                        }
 
-                    return {
-                        "total_km": total_km,
-                        "updated_at": update_date
-                    }
+            except asyncio.TimeoutError as err:
+                _LOGGER.warning("Timeout error on attempt %d: %s", attempt + 1, err)
+                if attempt == self._max_retries - 1:
+                    self._consecutive_failures += 1
+                    if self._consecutive_failures > 5:
+                        raise UpdateFailed("Multiple consecutive timeout errors")
+                    return self._last_known_values
+                await asyncio.sleep(2 ** attempt)  # Exponential backoff
 
-        except asyncio.TimeoutError as err:
-            raise UpdateFailed("Timeout error") from err
-        except aiohttp.ClientError as err:
-            raise UpdateFailed(f"Error communicating with API: {err}")
-        except Exception as err:
-            raise UpdateFailed(f"Unexpected error: {err}")
+            except ConfigEntryAuthFailed as auth_err:
+                raise auth_err  # Always raise auth errors
+
+            except aiohttp.ClientError as err:
+                _LOGGER.warning("API communication error on attempt %d: %s", attempt + 1, err)
+                if attempt == self._max_retries - 1:
+                    return self._last_known_values
+                await asyncio.sleep(2 ** attempt)
+
+            except Exception as err:
+                _LOGGER.error("Unexpected error on attempt %d: %s", attempt + 1, err)
+                if attempt == self._max_retries - 1:
+                    return self._last_known_values
+                await asyncio.sleep(2 ** attempt)
+
+        return self._last_known_values
 
     async def _login(self):
         """Login to OCTO Telematics."""
